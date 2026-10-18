@@ -1,0 +1,10 @@
+# Friend Agent 核心依赖
+openai>=1.40.0          # DeepSeek + Agnes（均 OpenAI 兼容）
+aiohttp>=3.9.0          # 微信 iLink Bot API（长轮询）
+cryptography>=42.0.0    # 微信媒体 AES-128-ECB 加解密
+chromadb>=0.5.0         # 本地向量记忆库
+ollama>=0.3.0           # 本地小脑
+textual>=0.80.0         # TUI 终端界面（借鉴 Pi TUI 组件化思想）
+requests>=2.31.0        # 天气 API
+python-dotenv>=1.0.0    # .env 密钥管理
+qrcode>=7.4.0           # 终端二维码渲染（微信扫码绑定）

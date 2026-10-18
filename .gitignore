@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.so
+venv/
+.env
+.venv/
+config/.env
+data/
+*.muse-github-snapshot-sync.json
+*.muse-github-snapshot-sync.json.tmp-*
+.DS_Store
