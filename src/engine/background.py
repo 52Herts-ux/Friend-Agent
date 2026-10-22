@@ -151,6 +151,8 @@ class BackgroundEngine:
         self._reset_daily_count(today)
         # 用户主动设的提醒在任何时间都要推送（含深夜）
         await self._check_reminders()
+        # 目标到期提醒：3 天内到期或已逾期，推一次（不走每日上限）
+        await self._check_goals()
         # 先发饭点/晚安关怀（晚安时间跟随自适应）
         await self._care_trigger(env, today)
         # 休息期：道晚安后静默，并做睡前总结 + 作息自适应
@@ -159,6 +161,8 @@ class BackgroundEngine:
             return
         # 每日自我进化反思（借鉴 Hermes）
         await self._maybe_reflect(env, today)
+        # 每日记忆整理（把零散记忆归纳成摘要，内部按天去重）
+        await self._memory_reflection(env)
         # 空闲才自主探索，避免抢占前台（以 AgentLoop 的最后交互时间为准）
         last = self.loop.last_interaction if self.loop else self.last_interaction
         if time.time() - last >= IDLE_SECONDS:
@@ -189,6 +193,32 @@ class BackgroundEngine:
                 store.mark_done(item["id"])
         except Exception as exc:
             logger.error("提醒检查失败: %s", exc)
+
+    async def _check_goals(self) -> None:
+        """目标到期提醒：3 天内到期或已逾期，每天最多推一次。"""
+        try:
+            from ..goals import default_goal_store
+            store = default_goal_store()
+            today = datetime.now().strftime("%Y-%m-%d")
+            key = f"goal_due_{today}"
+            if self._reminded.get(key) == today:
+                return
+            due = store.due_soon(days=3)
+            if not due:
+                return
+            lines = []
+            for g in due:
+                days_left = g.get("days_left", 0)
+                if days_left < 0:
+                    lines.append(f"「{g['title']}」已逾期 {abs(days_left)} 天，进度 {g.get('progress', 0)}%")
+                elif days_left == 0:
+                    lines.append(f"「{g['title']}」今天到期，进度 {g.get('progress', 0)}%")
+                else:
+                    lines.append(f"「{g['title']}」还有 {days_left} 天到期，进度 {g.get('progress', 0)}%")
+            await self.on_push("🎯 目标提醒：\n" + "\n".join(lines))
+            self._mark_reminded(key, today)
+        except Exception as exc:
+            logger.error("目标提醒检查失败: %s", exc)
 
     # ---- 主动关怀（概率化 + 每日上限：每天每种只掷一次骰子） ----
     async def _care_trigger(self, env: Dict, today: str) -> None:

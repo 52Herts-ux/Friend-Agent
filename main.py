@@ -57,6 +57,7 @@ def build_core():
     plugins.load_module("src.extensions.builtin.schedule_tool")
     plugins.load_module("src.extensions.builtin.run_command_tool")
     plugins.load_module("src.extensions.builtin.amap_tool")
+    plugins.load_module("src.extensions.builtin.goal_tool")
     # 需要依赖注入的工具（显式注册）
     plugins.register_tool(NoteTool(memory))
     plugins.register_tool(ClearMemoryTool(memory))

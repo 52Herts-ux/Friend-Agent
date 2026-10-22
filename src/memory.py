@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Dict, List, Optional
 
 import logging
@@ -84,7 +85,7 @@ class MemoryStore:
                 "category": category, "importance": importance}
         if metadata:
             meta.update(metadata)
-        mem_id = f"mem_{int(time.time() * 1000)}"
+        mem_id = f"mem_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
         self.collection.add(ids=[mem_id], documents=[text], metadatas=[meta])
         return mem_id
 

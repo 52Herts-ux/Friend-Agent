@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -40,7 +41,7 @@ class ReminderStore:
 
     def add(self, remind_at: str, content: str) -> str:
         """添加提醒。remind_at 为 'YYYY-MM-DD HH:MM' 或 'YYYY-MM-DD HH:MM:SS'。"""
-        rid = f"r{int(time.time() * 1000)}"
+        rid = f"r{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
         self._items.append({
             "id": rid,
             "remind_at": remind_at,

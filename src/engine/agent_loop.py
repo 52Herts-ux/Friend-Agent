@@ -20,7 +20,9 @@ from ..perception import get_environment_context
 from ..router import ModelRouter
 from ..limiter import RateLimitManager
 from ..extensions import PluginManager
+from ..security import wrap_tool_output
 from .context import build_messages, trim_history
+from pathlib import Path
 
 logger = logging.getLogger("friend-agent")
 
@@ -73,9 +75,53 @@ def _is_silent_end(text: str) -> bool:
     return t.lower() in _SILENT_END
 
 
+# 记忆提取允许的类别（与 memory.USER_CATEGORIES 一致）
+_MEMORY_CATEGORIES = {"user_preference", "plan", "fact", "note"}
+
+
+def _parse_memory_lines(result: str) -> List[tuple]:
+    """解析记忆提取模型的输出，只接受严格的「类别 | 内容」行。
+
+    模型偶尔会跑偏：不按格式输出、甚至直接以对话口吻回答用户。
+    这类行一律丢弃——绝不能像旧版那样把没有类别的行默认塞进
+    user_preference，否则 Agent 自己的话会被存成「用户记忆」（见 PLAN 8.10）。
+    """
+    out = []
+    for line in (result or "").strip().splitlines():
+        line = line.strip().lstrip("-•* ").strip()
+        if not line or line in ("无", "无。", "None", "没有"):
+            continue
+        if "|" not in line:
+            continue  # 不合格式（多半是模型跑偏成了对话），丢弃
+        cat, content = line.split("|", 1)
+        cat = cat.strip()
+        content = content.strip()
+        if cat not in _MEMORY_CATEGORIES or not content:
+            continue
+        out.append((cat, content))
+    return out
+
+
 # 上下文压缩：历史估算 token 超过窗口 80% 时压缩，压缩后保留最近 KEEP_RECENT 条
 COMPACT_RATIO = 0.8
 KEEP_RECENT = 6
+
+
+def _estimate_tokens(text: str) -> float:
+    """粗略估算 token 数（对齐 Muse 的按 token 压缩思路，不用字符数直接比窗口）。
+
+    经验值：中文 1 字 ≈ 1.5 token，英文约 4 字符 ≈ 1 token。
+    之前直接用 len(content) 比 128k 窗口，中文会低估、英文会高估。
+    """
+    if not text:
+        return 0.0
+    total = 0.0
+    for ch in text:
+        if ord(ch) > 0x2E7F:  # CJK 等宽字符
+            total += 1.5
+        else:
+            total += 0.25
+    return total
 
 
 class AgentLoop:
@@ -84,7 +130,7 @@ class AgentLoop:
     def __init__(self, router: ModelRouter, limiter: RateLimitManager,
                  memory: MemoryStore, persona: Persona,
                  plugins: Optional[PluginManager] = None, rhythm=None,
-                 usage_tracker=None):
+                 usage_tracker=None, history_path: str = "data/history.json"):
         self.router = router
         self.limiter = limiter
         self.memory = memory
@@ -92,8 +138,31 @@ class AgentLoop:
         self.plugins = plugins
         self.rhythm = rhythm  # 作息自适应追踪器
         self.usage_tracker = usage_tracker  # 用量统计（含思考模式）
-        self._history: Dict[str, List[Dict]] = {}
+        self._history_path = Path(history_path)
+        self._history: Dict[str, List[Dict]] = self._load_history()
         self.last_interaction: float = time.time()
+
+    def _load_history(self) -> Dict[str, List[Dict]]:
+        """重启后恢复对话历史（之前只在内存里，重启就丢）。"""
+        if not self._history_path.exists():
+            return {}
+        try:
+            data = json.loads(self._history_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception as exc:
+            logger.warning("对话历史加载失败: %s", exc)
+        return {}
+
+    def _save_history(self) -> None:
+        """每轮对话后持久化历史。"""
+        try:
+            self._history_path.parent.mkdir(parents=True, exist_ok=True)
+            self._history_path.write_text(
+                json.dumps(self._history, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except Exception as exc:
+            logger.warning("对话历史保存失败: %s", exc)
 
     def _history_for(self, user_id: str) -> List[Dict]:
         return self._history.setdefault(user_id, [])
@@ -140,7 +209,7 @@ class AgentLoop:
         if len(history) <= KEEP_RECENT + 4:
             return
         window = self.usage_tracker.context_window if self.usage_tracker else 128_000
-        total = sum(len(m.get("content", "")) for m in history)
+        total = sum(_estimate_tokens(m.get("content", "")) for m in history)
         if total < window * COMPACT_RATIO:
             return
         old = history[:-KEEP_RECENT]
@@ -196,11 +265,12 @@ class AgentLoop:
         return reply
 
     def _record(self, user_id: str, text: str, reply: str) -> None:
-        """把一轮对话写入短期历史并裁剪。"""
+        """把一轮对话写入短期历史并裁剪 + 持久化。"""
         hist = self._history_for(user_id)
         hist.append({"role": "user", "content": text})
         hist.append({"role": "assistant", "content": reply})
         self._history[user_id] = trim_history(hist)
+        self._save_history()
 
     async def _after_reply(self, user_id: str, text: str, reply: str) -> None:
         """回复后的生命周期钩子 + 后台异步提取记忆。"""
@@ -284,6 +354,7 @@ class AgentLoop:
                 except json.JSONDecodeError:
                     args = {}
                 result = await self.plugins.call_tool(tc["name"], args)
+                result = wrap_tool_output(tc["name"], result)
                 messages.append({"role": "tool", "tool_call_id": tc.get("id", ""),
                                  "content": result})
             reply = await self._run_tool_loop(model, name, messages, tools)
@@ -318,7 +389,7 @@ class AgentLoop:
                     for tc in tool_calls
                 ],
             })
-            # 执行每个工具并追加结果
+            # 执行每个工具并追加结果（工具输出按不可信数据包装，防注入）
             for tc in tool_calls:
                 args = {}
                 try:
@@ -326,21 +397,26 @@ class AgentLoop:
                 except json.JSONDecodeError:
                     args = {}
                 result = await self.plugins.call_tool(tc.function.name, args)
+                result = wrap_tool_output(tc.function.name, result)
                 messages.append({"role": "tool", "tool_call_id": tc.id,
                                  "content": result})
         return "（工具调用有点多，我先歇一下～）"
 
     async def _extract_memories(self, user_text: str, reply: str) -> None:
-        """用省钱层（Agnes）提取【用户本人说】的喜好/计划/重要事实，写入向量库。
+        """用省钱层（Agnes）提取【用户本人说】的信息，按类别写入向量库。
 
-        只提取用户说的内容，忽略 Agent 的回复/推荐，避免把 Agent 的话当成用户的记忆。
+        修复：之前不管什么都存成 user_preference，人和目标都混在一起。
+        现在按类别存：user_preference（喜好）/ plan（计划/目标）/
+        fact（事实）/ note（其他值得记的）。
         """
         try:
             prompt = (
-                "从「用户说」中提取【用户本人】的关键信息（喜好、计划、重要事实），"
-                "每条一行，用简洁短句，不要编造。"
+                "从「用户说」中提取【用户本人】值得长期记住的信息，"
+                "每条一行，格式：类别 | 内容。\n"
+                "类别只能是这 4 个：user_preference（喜好）、plan（计划/目标/考试/找工作）、"
+                "fact（事实，如学校、城市、设备）、note（其他值得记的）。\n"
                 "只提取用户自己说的内容，不要提取任何第三方或 AI 的观点。"
-                "注意：临时的查询/问路/查路线/问天气不是「计划」也不是「事实」，不要提取。"
+                "临时的查询/问路/查路线/问天气不是计划也不是事实，不要提取。"
                 "如果没有值得长期记住的，输出「无」。\n"
                 f"用户说：{user_text}"
             )
@@ -348,9 +424,7 @@ class AgentLoop:
             await self.limiter.acquire("agnes")
             result = await model.chat(
                 [{"role": "user", "content": prompt}], temperature=0.2)
-            for line in result.strip().splitlines():
-                line = line.strip().lstrip("-•* ").strip()
-                if line and line not in ("无", "无。", "None", "没有"):
-                    self.memory.store(line, category="user_preference", importance=2)
+            for cat, content in _parse_memory_lines(result):
+                self.memory.store(content, category=cat, importance=2)
         except Exception as exc:
             logger.debug("记忆提取失败（不影响主流程）: %s", exc)

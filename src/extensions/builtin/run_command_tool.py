@@ -1,15 +1,19 @@
-"""Shell 命令执行工具：让 Agent 执行 Linux 命令（带超时、输出截断、危险拦截）。
+"""Shell 命令执行工具：让 Agent 执行 Linux 命令（带超时、输出截断、危险拦截 + 审批）。
 
 安全设计：
 - 超时 30 秒自动终止，避免命令卡死
 - 输出截断到 4000 字符，避免超长输出撑爆上下文
 - 危险命令黑名单拦截（删根、格式化磁盘、写盘、关机、fork 炸弹等）
+- 需要审批的操作（写文件 / 联网下载 / 安装 / git push 等）：
+  首次调用不执行，只返回“需要用户确认”，LLM 必须先在对话里问用户，
+  用户明确确认后，才能带 confirm=True 再调一次。
 """
 from __future__ import annotations
 
 import asyncio
 
 from ..base import Tool
+from ...security import classify_command
 
 TIMEOUT_SECONDS = 30
 MAX_OUTPUT = 4000
@@ -38,12 +42,16 @@ class RunCommandTool(Tool):
             "command": {
                 "type": "string",
                 "description": "要执行的 shell 命令（单条，如 'ls -la'、'git status'）"
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "需要审批的操作，必须用户在对话里明确确认后才传 true；否则只返回确认提示，不执行。"
             }
         },
         "required": ["command"],
     }
 
-    async def run(self, command: str = "") -> str:
+    async def run(self, command: str = "", confirm: bool = False) -> str:
         cmd = (command or "").strip()
         if not cmd:
             return "命令为空"
@@ -52,6 +60,16 @@ class RunCommandTool(Tool):
         for d in _DANGEROUS:
             if d in cmd:
                 return f"⛔ 已拦截：命令包含危险操作「{d}」，拒绝执行。"
+
+        # 需要审批的操作：未确认时不执行，只返回确认提示
+        level, reason = classify_command(cmd)
+        if level == "needs_approval" and not confirm:
+            return (
+                f"⚠️ 该命令需要用户确认后才能执行（触发规则：{reason}）。\n"
+                f"命令：{cmd}\n"
+                "请先在对话里把这条命令和风险告诉用户，用户明确说“确认执行”后，"
+                "再带 confirm=True 重新调用一次。不要自行猜测用户已确认。"
+            )
 
         try:
             proc = await asyncio.create_subprocess_shell(
